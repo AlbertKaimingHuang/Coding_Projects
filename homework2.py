@@ -148,11 +148,10 @@ def histogram_of_gradients(img, pix):
     # TODO
     Ix = gradient_x(img)
     Iy = gradient_y(img)
-    m = 6
+    m = 4
     half = m*m // 2
-    index = (np.arange(-half, half)+0.5)*2/3
+    index = np.arange(-half, half)+0.5
     dx, dy = np.meshgrid(index, index)
-    weight = np.exp(-(dx**2+dy**2)/(2*m**2))
 
     features = []
     for x, y in pix:
@@ -163,40 +162,23 @@ def histogram_of_gradients(img, pix):
         patch_magnitude = np.sqrt(patch_Ix**2+patch_Iy**2)
         patch_theta = np.arctan2(patch_Iy, patch_Ix)
         
-        patch_magnitude = np.hypot(patch_Ix, patch_Iy)
-        patch_theta = np.arctan2(patch_Iy, patch_Ix)
-
-        hist, _ = np.histogram(patch_theta, bins=36, range=(-np.pi, np.pi), weights=patch_magnitude * weight,)
-        hist = ndimage.gaussian_filter1d(hist, sigma=1.5, mode="wrap")
+        hist, _ = np.histogram(patch_theta, bins=36, range=(-np.pi, np.pi), weights=patch_magnitude)
         average_index = np.argmax(hist)
-        left = hist[(average_index - 1) % 36]
-        center = hist[average_index]
-        right = hist[(average_index + 1) % 36]
-        denominator = 2 * (2*center - left - right)
-
-        delta = 0.0
-        if denominator != 0:
-            delta = (right - left) / denominator
-
-        average_theta = -np.pi+(average_index+0.5+delta)*np.pi/18
+        average_theta = -np.pi + (average_index+0.5)*np.pi/18
         newx = x + dx*np.cos(average_theta) - dy*np.sin(average_theta)
         newy = y + dx*np.sin(average_theta) + dy*np.cos(average_theta)
         new_Ix = ndimage.map_coordinates(Ix, [newy, newx], order=1, mode="reflect")
         new_Iy = ndimage.map_coordinates(Iy, [newy, newx], order=1, mode="reflect")
         new_theta =  (np.arctan2(new_Iy, new_Ix)-average_theta)% (2*np.pi)
-        new_magnitude = np.hypot(new_Ix, new_Iy)
+        new_magnitude = np.sqrt(new_Ix**2+new_Iy**2)
 
         feature = []
         for i in range(m):
             for j in range(m):
-                cell = np.s_[i*m:(i+1)*m, j*m:(j+1)*m]
-                position = new_theta[cell] * 8 / (2*np.pi) - 0.5
-                lower_bin = np.floor(position).astype(int)
-                fraction = position - lower_bin
-                magnitude = new_magnitude[cell]
-                left_votes = np.bincount((lower_bin % 8).ravel(), weights=(magnitude * (1 - fraction)).ravel(), minlength=8)
-                right_votes = np.bincount(((lower_bin + 1) % 8).ravel(), weights=(magnitude * fraction).ravel(), minlength=8)
-                feature.extend(left_votes + right_votes)
+                cell_theta = new_theta[i*m:(i+1)*m, j*m:(j+1)*m]
+                cell_magnitude = new_magnitude[i*m:(i+1)*m, j*m:(j+1)*m]
+                histqwe, _ = np.histogram(cell_theta, bins=8, range=(0, 2*np.pi), weights=cell_magnitude)
+                feature.extend(histqwe)
         feature = np.array(feature, dtype=np.float64)
         norm = np.linalg.norm(feature)
         if norm > 0:
@@ -205,6 +187,11 @@ def histogram_of_gradients(img, pix):
 
     return np.array(features, dtype=np.float64).reshape(len(pix), m*m*8)
         
+
+
+
+
+
 
 
 
@@ -309,29 +296,14 @@ def compute_homography(pixels_1, pixels_2):
     '''
     # TODO
     A = []
-    normalized = []
-    transforms = []
-    for pixels in (pixels_1, pixels_2):
-        pixels = np.asarray(pixels, dtype=np.float64)
-        center = pixels.mean(axis=0)
-        centered = pixels - center
-        mean_distance = np.linalg.norm(centered, axis=1).mean()
-        scale = np.sqrt(2) / mean_distance
-        normalized.append(centered * scale)
-        transforms.append(np.array([
-            [scale, 0, -scale * center[0]],
-            [0, scale, -scale * center[1]],
-            [0, 0, 1],
-        ]))
-    for (x, y), (u, v) in zip(normalized[0], normalized[1]):
+    for (x, y), (u, v) in zip(pixels_1, pixels_2):
         A.append([-x, -y, -1, 0, 0, 0, u*x, u*y, u])
         A.append([0, 0, 0, -x, -y, -1, v*x, v*y, v])
     A = np.array(A, dtype=np.float64)
-    _, _, V = np.linalg.svd(A, full_matrices=A.shape[0] < A.shape[1])
-    h_norm = V[-1].reshape(3, 3)
-    T1, T2 = transforms
-    h = np.linalg.solve(T2, h_norm @ T1)
-    return h / h[2, 2]
+    U, S, V = np.linalg.svd(A)
+    h = V[-1].reshape(3, 3)
+    h /= h[2, 2]
+    return h
 
 
 # ---------------------------------------------------------------------------
@@ -569,8 +541,6 @@ PANORAMA_SCENES = {
 
 
 if __name__ == '__main__':
-    from utils import generate_cylindrical_panorama
-
     os.makedirs(OUTDIR, exist_ok=True)
 
     # sanity check of Q1-Q3 on the default pair
@@ -592,9 +562,6 @@ if __name__ == '__main__':
         blend = stitch_blend(img_1, img_2, homo)
         cv2.imwrite(f'{OUTDIR}/blend_{bid}.png', np.uint8(blend))
 
-    # Focal lengths in pixels for the two five-frame cylindrical sequences.
-    cylindrical_focals = {2: 790, 4: 835}
-
     # stitch the four provided scenes
     for pid, scene in PANORAMA_SCENES.items():
         img_list = load_image_sequence(f'{IMGDIR}/panoramas/{scene}')
@@ -603,12 +570,9 @@ if __name__ == '__main__':
             half = BASE_MAX_FRAMES // 2
             img_list = img_list[mid - half: mid - half + BASE_MAX_FRAMES]
         try:
-            if pid in cylindrical_focals:
-                pano = generate_cylindrical_panorama(
-                    img_list, feature_matching, cylindrical_focals[pid]
-                )
-            else:
-                pano = generate_panorama(img_list)
+            pano = generate_panorama(img_list)
             cv2.imwrite(f'{OUTDIR}/panorama_{pid}.png', pano)
         except Exception as e:
-            print(f'scene "{scene}": stitching failed ({e}).')
+            print(f'scene "{scene}": plane-based stitching failed ({e}). '
+                  f'A full 360-degree panorama needs cylindrical '
+                  f'projection (see Q4.4 and bonus 3).')
