@@ -371,55 +371,42 @@ def stitch_blend(img_1, img_2, est_homo):
     with linear interpolation) and blend them with alpha blending.
     You may rewrite this with a better blending method for the bonus.
     '''
-    h1, w1, d1 = np.shape(img_1)  # d = 3 channels
-    h2, w2, d2 = np.shape(img_2)
-    p1 = est_homo.dot(np.array([0, 0, 1]))
-    p2 = est_homo.dot(np.array([0, h1, 1]))
-    p3 = est_homo.dot(np.array([w1, 0, 1]))
-    p4 = est_homo.dot(np.array([w1, h1, 1]))
-    p1 = np.int16(p1 / p1[2])
-    p2 = np.int16(p2 / p2[2])
-    p3 = np.int16(p3 / p3[2])
-    p4 = np.int16(p4 / p4[2])
-    x_min = min(0, p1[0], p2[0], p3[0], p4[0])
-    x_max = max(w2, p1[0], p2[0], p3[0], p4[0])
-    y_min = min(0, p1[1], p2[1], p3[1], p4[1])
-    y_max = max(h2, p1[1], p2[1], p3[1], p4[1])
-    x_range = np.arange(x_min, x_max + 1, 1)
-    y_range = np.arange(y_min, y_max + 1, 1)
-    x, y = np.meshgrid(x_range, y_range)
-    x = np.float32(x)
-    y = np.float32(y)
-    homo_inv = np.linalg.pinv(est_homo)
-    trans_x = homo_inv[0, 0] * x + homo_inv[0, 1] * y + homo_inv[0, 2]
-    trans_y = homo_inv[1, 0] * x + homo_inv[1, 1] * y + homo_inv[1, 2]
-    trans_z = homo_inv[2, 0] * x + homo_inv[2, 1] * y + homo_inv[2, 2]
-    trans_x = np.float32(trans_x / trans_z)
-    trans_y = np.float32(trans_y / trans_z)
-    # note: cv2.remap requires CV_32F maps; float64 maps raise an error
-    # remap in float32 so that interpolation keeps sub-pixel precision
-    est_img_1 = cv2.remap(np.float32(img_1), trans_x, trans_y,
-                          cv2.INTER_LINEAR)
-    est_img_2 = cv2.remap(np.float32(img_2), x, y, cv2.INTER_LINEAR)
-    alpha1 = cv2.remap(np.ones(np.shape(img_1), dtype=np.float32), trans_x,
-                       trans_y, cv2.INTER_LINEAR)
-    alpha2 = cv2.remap(np.ones(np.shape(img_2), dtype=np.float32), x, y,
-                       cv2.INTER_LINEAR)
-    # undo the black-border premultiplication: near a frame's border,
-    # INTER_LINEAR scales BOTH the remapped color and the coverage mask by
-    # the same fractional coverage t (the default border is black), so
-    # blending the colors directly would darken a band along every seam
-    # by roughly (t^2+1)/(t+1). Dividing the color by its mask restores
-    # the true brightness before the weighted average.
-    eps = 1e-6
-    est_img_1 = est_img_1 / np.maximum(alpha1, eps)
-    est_img_2 = est_img_2 / np.maximum(alpha2, eps)
-    alpha = alpha1 + alpha2
-    alpha[alpha == 0] = 2
-    alpha1 = alpha1 / alpha
-    alpha2 = alpha2 / alpha
-    est_img = est_img_1 * alpha1 + est_img_2 * alpha2
-    return est_img
+    transforms = (est_homo, np.eye(3))
+    images = (img_1, img_2)
+    bounds = []
+    for image, transform in zip(images, transforms):
+        height, width = image.shape[:2]
+        corners = np.array([[0, 0, 1], [width - 1, 0, 1],
+                            [0, height - 1, 1], [width - 1, height - 1, 1]])
+        projected = corners @ transform.T
+        depth = projected[:, 2]
+        if depth.min() <= 0 <= depth.max():
+            raise ValueError("Homography maps part of the image to infinity")
+        bounds.append(projected[:, :2] / depth[:, None])
+
+    bounds = np.vstack(bounds)
+    x0, y0 = np.floor(bounds.min(axis=0)).astype(int)
+    x1, y1 = np.ceil(bounds.max(axis=0)).astype(int)
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    translate = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]])
+    colors = np.zeros((height, width, 3), dtype=np.float32)
+    weights = np.zeros((height, width), dtype=np.float32)
+
+    for image, transform in zip(images, transforms):
+        h, w = image.shape[:2]
+        x = np.arange(w)
+        y = np.arange(h)
+        edge_x = np.minimum(x + 1, w - x)
+        edge_y = np.minimum(y + 1, h - y)
+        # Taper the weight near each source image border.
+        feather = np.minimum(edge_y[:, None], edge_x[None, :])
+        feather = np.minimum(feather / (min(h, w) / 6), 1).astype(np.float32)
+        warp = translate @ transform
+        colors += cv2.warpPerspective(image.astype(np.float32) * feather[..., None],
+                                      warp, (width, height))
+        weights += cv2.warpPerspective(feather, warp, (width, height))
+
+    return np.clip(colors / np.maximum(weights[..., None], 1e-6), 0, 255)
 
 
 # ---------------------------------------------------------------------------
@@ -454,59 +441,142 @@ def generate_panorama(ordered_img_seq):
     stitching the full sequence requires cylindrical projection (see the
     assignment PDF, Q4.4 and bonus 3).
     '''
-    n = len(ordered_img_seq)
-    mid = n // 2  # middle anchor
+    images = ordered_img_seq
+    if not images:
+        raise ValueError("At least one image is required")
+    if len(images) == 1:
+        return images[0].copy()
 
-    # H[i] maps image i into the anchor frame
-    H = [None] * n
-    H[mid] = np.eye(3)
-    for j in range(mid + 1, n):
-        pix1, pix2 = feature_matching(ordered_img_seq[j],
-                                      ordered_img_seq[j - 1])
-        H[j] = H[j - 1].dot(align_pair(pix1, pix2))
-    for i in range(mid - 1, -1, -1):
-        pix1, pix2 = feature_matching(ordered_img_seq[i],
-                                      ordered_img_seq[i + 1])
-        H[i] = H[i + 1].dot(align_pair(pix1, pix2))
+    middle = len(images) // 2
+    links = [(i, i - 1) for i in range(middle + 1, len(images))]
+    links += [(i, i + 1) for i in range(middle - 1, -1, -1)]
+    centers = [np.array([(im.shape[1] - 1) / 2, (im.shape[0] - 1) / 2])
+               for im in images]
+    image_sizes = [max(im.shape[:2]) for im in images]
+    rng = np.random.default_rng(0)
+    correspondences = []
 
-    # bounding box of all warped frames in the anchor coordinate system
-    xs, ys = [], []
-    for i, img in enumerate(ordered_img_seq):
-        h, w = np.shape(img)[:2]
-        for cx, cy in ((0, 0), (0, h), (w, 0), (w, h)):
-            p = H[i].dot(np.array([cx, cy, 1.0]))
-            p = p / p[2]
-            xs.append(p[0])
-            ys.append(p[1])
-    x_min, x_max = int(np.floor(min(xs))), int(np.ceil(max(xs)))
-    y_min, y_max = int(np.floor(min(ys))), int(np.ceil(max(ys)))
+    for source, target in links:
+        a, b = images[source], images[target]
+        width_a, width_b = a.shape[1], b.shape[1]
+        variants = [(a, b, 0, 0, 1.0)]
+        for fraction in (0.5, 0.65):
+            wa = max(1, round(width_a * fraction))
+            wb = max(1, round(width_b * fraction))
+            xa = width_a - wa if source < target else 0
+            xb = width_b - wb if source > target else 0
+            variants.extend((a[:, xa:xa+wa], b[:, xb:xb+wb], xa, xb, scale)
+                            for scale in (1.0, 0.65))
 
-    x, y = np.meshgrid(np.arange(x_min, x_max + 1),
-                       np.arange(y_min, y_max + 1))
-    x = np.float32(x)
-    y = np.float32(y)
+        matches = []
+        for first, second, xa, xb, scale in variants:
+            if scale != 1.0:
+                first = cv2.resize(first, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                second = cv2.resize(second, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            try:
+                p, q = feature_matching(first, second)
+            except (AssertionError, ZeroDivisionError):
+                continue
+            p = (np.asarray(p, dtype=float) + 0.5) / scale - 0.5 + [xa, 0]
+            q = (np.asarray(q, dtype=float) + 0.5) / scale - 0.5 + [xb, 0]
+            matches.append(np.column_stack((p, q)))
 
-    acc = np.zeros((y_max - y_min + 1, x_max - x_min + 1, 3),
-                   dtype=np.float32)
-    wsum = np.zeros((y_max - y_min + 1, x_max - x_min + 1, 1),
-                    dtype=np.float32)
-    for i, img in enumerate(ordered_img_seq):
-        # map canvas coordinates back into image i (inverse warping)
-        Minv = np.linalg.pinv(H[i])
-        tx = Minv[0, 0] * x + Minv[0, 1] * y + Minv[0, 2]
-        ty = Minv[1, 0] * x + Minv[1, 1] * y + Minv[1, 2]
-        tz = Minv[2, 0] * x + Minv[2, 1] * y + Minv[2, 2]
-        tx = np.float32(tx / tz)
-        ty = np.float32(ty / tz)
-        warped = cv2.remap(np.float32(img), tx, ty, cv2.INTER_LINEAR)
-        cover = cv2.remap(np.ones(np.shape(img)[:2], dtype=np.float32),
-                          tx, ty, cv2.INTER_LINEAR)[..., None]
-        # undo the black-border premultiplication (see stitch_blend)
-        warped = warped / np.maximum(cover, 1e-6)
-        acc += warped * cover
-        wsum += cover
-    est_pano = np.uint8(np.clip(acc / np.maximum(wsum, 1e-6), 0, 255))
-    return est_pano
+        if not matches:
+            raise ValueError(f"Could not match frames {source + 1} and {target + 1}")
+        matches = np.vstack(matches)
+        _, unique = np.unique(np.rint(matches / 3).astype(int), axis=0, return_index=True)
+        matches = matches[np.sort(unique)]
+        if len(matches) < 4:
+            raise ValueError(f"Too few matches for frames {source + 1} and {target + 1}")
+        samples = np.array([rng.choice(len(matches), 3, replace=False) for _ in range(450)])
+        correspondences.append((matches[:, :2], matches[:, 2:], samples))
+
+    best_score = (-1, -np.inf)
+    for ratio in (0.65, 0.75, 0.835, 0.9, 1.0, 1.1, 1.25, 1.4):
+        focals = [size * ratio for size in image_sizes]
+        rotations = [None] * len(images)
+        rotations[middle] = np.eye(3)
+        total_inliers = 0
+        total_error = 0.0
+        for (source, target), (p, q, samples) in zip(links, correspondences):
+            source_xy = (p - centers[source]) / focals[source]
+            target_xy = (q - centers[target]) / focals[target]
+            source_rays = np.column_stack((source_xy, np.ones(len(p))))
+            target_rays = np.column_stack((target_xy, np.ones(len(q))))
+            source_rays /= np.linalg.norm(source_rays, axis=1, keepdims=True)
+            target_rays /= np.linalg.norm(target_rays, axis=1, keepdims=True)
+
+            covariance = target_rays[samples].transpose(0, 2, 1) @ source_rays[samples]
+            U, _, V = np.linalg.svd(covariance)
+            U[:, :, -1] *= np.linalg.det(U @ V)[:, None]
+            candidates = U @ V
+            rays = source_rays @ candidates.transpose(0, 2, 1)
+            depth = rays[:, :, 2]
+            projected = rays[:, :, :2] / np.maximum(depth[:, :, None], 1e-6)
+            projected = projected * focals[target] + centers[target]
+            errors = np.linalg.norm(projected - q, axis=2)
+            inliers = (depth > 0) & (errors < 3)
+            counts = inliers.sum(axis=1)
+            best_count = counts.max()
+            if best_count < 4:
+                break
+            ties = np.flatnonzero(counts == best_count)
+            inlier_error = np.where(inliers[ties], errors[ties], 0).sum(axis=1)
+            choice = np.argmin(inlier_error)
+            selected = inliers[ties[choice]]
+            U, _, V = np.linalg.svd(target_rays[selected].T @ source_rays[selected])
+            U[:, -1] *= np.linalg.det(U @ V)
+            rotations[source] = rotations[target] @ U @ V
+            total_inliers += best_count
+            total_error += inlier_error[choice]
+        else:
+            score = (total_inliers, -total_error)
+            if score > best_score:
+                best_score = score
+                best_rotations = rotations
+                best_focals = focals
+
+    if best_score[0] < 0:
+        raise ValueError("Could not align the image sequence")
+
+    focal = best_focals[middle]
+    boundaries = []
+    for image, center, image_focal, rotation in zip(images, centers, best_focals, best_rotations):
+        h, w = image.shape[:2]
+        x = np.linspace(0, w - 1, 97)
+        y = np.linspace(0, h - 1, 97)
+        boundary = np.vstack((np.column_stack((x, np.zeros_like(x))),
+                              np.column_stack((x, np.full_like(x, h-1))),
+                              np.column_stack((np.zeros_like(y), y)),
+                              np.column_stack((np.full_like(y, w-1), y))))
+        xy = (boundary - center) / image_focal
+        x, y, z = (np.column_stack((xy, np.ones(len(xy)))) @ rotation.T).T
+        boundaries.append(np.column_stack((focal*np.arctan2(x, z), focal*y/np.hypot(x, z))))
+
+    bounds = np.vstack(boundaries)
+    x0, y0 = np.floor(bounds.min(axis=0)).astype(int)
+    x1, y1 = np.ceil(bounds.max(axis=0)).astype(int)
+    u, v = np.meshgrid(np.arange(x0, x1 + 1, dtype=np.float32),
+                       np.arange(y0, y1 + 1, dtype=np.float32))
+    rays = np.stack((np.sin(u/focal), v/focal, np.cos(u/focal)), axis=-1)
+    colors = np.zeros((*u.shape, 3), dtype=np.float32)
+    weights = np.zeros(u.shape, dtype=np.float32)
+
+    for image, center, image_focal, rotation in zip(images, centers, best_focals, best_rotations):
+        x, y, depth = (rays @ rotation.astype(np.float32)).transpose(2, 0, 1)
+        safe_depth = np.maximum(depth, 1e-6)
+        map_x = np.where(depth > 1e-6, image_focal*x/safe_depth + center[0], -1).astype(np.float32)
+        map_y = np.where(depth > 1e-6, image_focal*y/safe_depth + center[1], -1).astype(np.float32)
+        h, w = image.shape[:2]
+        edge_x = np.minimum(map_x, w - 1 - map_x)
+        edge_y = np.minimum(map_y, h - 1 - map_y)
+        feather = np.clip((np.minimum(edge_x, edge_y) + 1) / 32, 0, 1)
+        warped = cv2.remap(image.astype(np.float32), map_x, map_y, cv2.INTER_LINEAR)
+        coverage = cv2.remap(np.ones((h, w), dtype=np.float32), map_x, map_y, cv2.INTER_LINEAR)
+        colors += warped * feather[..., None]
+        weights += coverage * feather
+
+    return np.uint8(np.clip(colors / np.maximum(weights[..., None], 1e-6), 0, 255))
 
 
 # ---------------------------------------------------------------------------
